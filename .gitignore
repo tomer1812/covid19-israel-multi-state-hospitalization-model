@@ -1,0 +1,13 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/fit_data/
+malka_notebooks/
+scratch*
+.DS_Store
+future_hospitalized_with_no_past_positive_test.Rmd
+future_hospitalized_with_no_past_positive_test.html
+.virtualenv/
+*data*
+.idea/

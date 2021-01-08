@@ -1,0 +1,543 @@
+---
+title: "Multi-State-Model Wave2"
+author: "Jonathan Somer"
+date: "12/26/2020"
+output: html_document
+params:
+  positive_to_hospitalized_csv: NULL
+  hospitalized_onward_csv: NULL
+  model_cache_file: NULL
+  use_15_9_reduced_model: NULL
+---
+
+```{r}
+print(params)
+
+POSITIVE_TO_HOSPITALIZED_CSV = params$positive_to_hospitalized_csv # 'data/fit_data/01-positive_to_hospitalized.csv'
+HOSITALIZED_ONWARD_CSV = params$hospitalized_onward_csv # 'data/fit_data/02-hospitalized_onward.csv'
+
+MODEL_CACHE_FILE = params$model_cache_file
+USE_15_9_REDUCED_MODEL = params$use_15_9_reduced_model
+
+stopifnot((!is.null(POSITIVE_TO_HOSPITALIZED_CSV)) & (!is.null(POSITIVE_TO_HOSPITALIZED_CSV)))
+```
+
+
+
+
+```{r}
+
+source('utils/wave2_utils.R')
+source('./model/wave2_model.R')
+#library(formattable)
+
+VERBOSE = FALSE
+```
+
+
+# Fit is done in three stages: 
+
+1. Fit a `pos-> hosp/home` `CompetingRisksModel()`
+2. Fit a `hosp -> ...` `MultiStateModel()`
+3. Add the `pos-> hosp/home`model to the multi-state model.
+
+## 1. Fit Competing Risks Model From Positive Diagnosis:
+
+### Columns used: 
+
+- `first_positive_test_date`
+- `days_from_positive_to_hosp` (date to censoring in case of no first_date, used as time to `home`)
+- `new_type0` (hospitalized at this state)
+- `sector` 
+
+** Not used: **
+- `first_date` (date of hospitalization)
+
+```{r}
+pos_df = read.csv(POSITIVE_TO_HOSPITALIZED_CSV, row.names = 1,stringsAsFactors=FALSE)
+pos_df$sector = ifelse(pos_df$sector == "unknown", yes = "arab", no = pos_df$sector)
+stopifnot(sum(pos_df$sector == "unknown") == 0)
+#formattable(head(pos_df, n=5))
+```
+
+```{r}
+. = format_positive_to_hospitalization_df(pos_df, use_sector=TRUE)
+with_sector_pos_df = .$pos_df
+with_sector_covariate_names = .$covariate_names
+
+# make sure using split MnM state
+stopifnot(sum(with_sector_pos_df$type0 == MILD_OR_MODERATE) == 0)
+
+stopifnot(max(with_sector_pos_df[with_sector_pos_df$type0==HOME,]$days_from_positive_to_hosp) > 25)
+
+#formattable(head(with_sector_pos_df, n=5))
+```
+
+
+```{r}
+t_transition = with_sector_pos_df$days_from_positive_to_hosp
+target_state = with_sector_pos_df$type0
+covariates_X = with_sector_pos_df[,with_sector_covariate_names]
+
+with_sector_pos_to_hosp_model = CompetingRisksModel()
+with_sector_pos_to_hosp_model$fit(t_transition, target_state, covariates_X, verbose = 2)
+```
+
+### Sanity Check 1:
+
+```{r}
+with_sector_covariates_example = covariates_X[1,]
+sum_probs = print_next_state_probabilities(with_sector_pos_to_hosp_model, with_sector_covariates_example, 0)
+stopifnot( (sum_probs >= 0.9) && (sum_probs <= 1.1) )
+```
+
+### PATCH: only `pos->home` should use sector.
+
+
+1. Fit `c(age,sex, age*sex)` CompetingRisksModel at state POSITIVE:
+
+```{r}
+. = format_positive_to_hospitalization_df(pos_df, use_sector=FALSE)
+no_sector_pos_df = .$pos_df
+no_sector_covariate_names = .$covariate_names
+
+# make sure using split MnM state
+stopifnot(sum(no_sector_pos_df$type0 == MILD_OR_MODERATE) == 0)
+
+#formattable(head(no_sector_pos_df, n=5))
+```
+
+
+```{r}
+t_transition = no_sector_pos_df$days_from_positive_to_hosp
+target_state = no_sector_pos_df$type0
+covariates_X = no_sector_pos_df[,no_sector_covariate_names]
+
+no_sector_pos_to_hosp_model = CompetingRisksModel()
+no_sector_pos_to_hosp_model$fit(t_transition, target_state, covariates_X, verbose=2)
+```
+
+### Sanity Check 2:
+
+```{r}
+no_sector_covariated_example = covariates_X[1,]
+sum_probs = print_next_state_probabilities(no_sector_pos_to_hosp_model, no_sector_covariated_example, 0)
+stopifnot( (sum_probs >= 0.9) && (sum_probs <= 1.1) )
+```
+
+Extend no-sector model covariates to allow for receiving samples with all covariates:
+
+NOTE! - In order to use the correct baseline hazard function, we need to stretch the covariates of the age,sex only model and use that model, AND DO NOT overwrite the covariates of the with_sector_ model (whose baseline hazard function corresponds to the baseline of "all-zeros" patients, in this case: an aged 0, female, **arab** patient)
+
+```{r}
+
+for (f in no_sector_pos_to_hosp_model$failure_types) {
+  coefs = no_sector_pos_to_hosp_model$event_specific_models[[f]]$coefficients
+  
+  new_coefs = c(
+    # 1. age
+    # 2. gendermale
+    coefs[c(1,2)], 
+    
+    # 3. sectorharedim
+    # 4. sectormixed
+    # 5. sectorrest
+    rep(0, 3),
+    # 6. age:gendermale
+    coefs[c(3)],
+    # 7. age:sectorharedim
+    # 8. age:sectormixed
+    # 9. age:sectorrest
+    # 10. gendermale:sectorharedim
+    # 11. gendermale:sectormixed
+    # 12. gendermale:sectorrest
+    rep(0, 6)
+  )
+
+  no_sector_pos_to_hosp_model$event_specific_models[[f]]$coefficients = new_coefs
+}
+```
+
+
+Overwrite `pos->home` model in the `no_sector_pos_to_hosp_model` CompetingRisksModel() with one that utilizes sector.
+
+
+```{r}
+no_sector_pos_to_hosp_model$event_specific_models[[HOME]] = with_sector_pos_to_hosp_model$event_specific_models[[HOME]]
+```
+
+
+Resulting coefficients of all models:
+
+```{r}
+
+coefficients_table = function(cr_model, covariate_names) {
+  
+  coefficients_df = data.frame()
+  for (next_state in 1:length((cr_model$event_specific_models))) {
+    
+    model = cr_model$event_specific_models[[next_state]]
+    
+    if (is.null(model)) next
+    
+    coefficients_df = rbind(coefficients_df, c(next_state, model$coefficients))
+  }
+  
+  colnames(coefficients_df) = c("next_state", covariate_names)
+  return(coefficients_df)
+}
+
+#formattable(coefficients_table(no_sector_pos_to_hosp_model, with_sector_covariate_names))
+```
+
+Rename the "no_sector" CompetingRisksModel which now allows sector covariates, and includes the pos->home model which has sector covariates
+
+```{r}
+pos_to_hosp_model = no_sector_pos_to_hosp_model
+```
+
+
+### Sanity Check 3:
+```{r}
+sum_probs = print_next_state_probabilities(pos_to_hosp_model, with_sector_covariates_example, 0)
+stopifnot( (sum_probs >= 0.9) && (sum_probs <= 1.1) )
+```
+
+
+
+## 2. Fit "hosp -> ... " Multi-State-Model: 
+
+
+```{r}
+hosp_df = read.csv(HOSITALIZED_ONWARD_CSV,stringsAsFactors=FALSE)
+#formattable(head(hosp_df, n=5))
+```
+
+
+```{r}
+. = construct_msm_dataset_from_hospitalized_onward_df(hosp_df)
+dataset = .$dataset
+covariate_names = .$covariate_names
+
+dataset[[1]]
+```
+
+
+```{r}
+
+# sample_covariates on entry to origin_state
+# target_state might be MILD / MODERATE if leaving POSITIVE state.
+update_covariates_function = function(sample_covariates, origin_state, target_state, time_at_origin_state, absolute_time_of_entry_to_target_state=NULL) {
+  
+  # this shouldn't happen:
+  if ( (origin_state == POSITIVE) & (target_state == HOME) ) NULL$zappa
+  
+  if (origin_state == POSITIVE) {
+    # # can assume patient has "positive-style" covariates:
+    
+    return(
+      construct_hospitalized_patient_covariates(
+        age = sample_covariates[AGE_COVARIATE_IDX],
+        is_male = sample_covariates[IS_MALE_COVARIATE_IDX],
+        state_at_hospitalization = target_state,
+        cumulative_time_since_hospitalization = 0,
+        was_severe = 0,
+        was_critical = 0
+      )
+    )
+    
+  } else { 
+    # can assume patient has "hospitalized-style" covariates:
+    
+    return(
+      construct_hospitalized_patient_covariates(
+        age = sample_covariates[AGE_COVARIATE_IDX],
+        is_male = sample_covariates[IS_MALE_COVARIATE_IDX],
+        state_at_hospitalization = get_state_at_hospitalization(sample_covariates),
+        
+        # in case prediction starts from t > 0. The cumulative time can be 0, as it was in entry to state.  
+        # But the cumulative time in the next state needs to include both the time spent in the state thus far, and the remaining time
+        cumulative_time_since_hospitalization = max(sample_covariates[CUMULATIVE_TIME_COVARIATE_IDX] + time_at_origin_state, 
+                                                    absolute_time_of_entry_to_target_state), 
+        
+        was_severe = sample_covariates[WAS_SEVERE_COVARIATE_IDX] | (origin_state == SEVERE),
+        was_critical = sample_covariates[WAS_CRITICAL_COVARIATE_IDX] | (origin_state == CRITICAL)
+      )
+      
+    )    
+  }
+}
+
+
+model = Wave2MultiStateModel()
+model$fit(dataset,
+          terminal_states = TERMINAL_STATES,
+          update_covariates_function,
+          covariate_names=covariate_names)
+```
+
+```{r}
+comp_ds = model$prepare_dataset_for_competing_risks_fit(dataset, TERMINAL_STATES, update_covariates_function)
+crit_to_disch_df = comp_ds[comp_ds$origin_state == 5 & comp_ds$target_state == 7,5:20]
+sum(crit_to_disch_df$state_at_hospitalizationmild)
+sum(crit_to_disch_df$state_at_hospitalizationmoderate)
+sum(crit_to_disch_df$state_at_hospitalizationsevere)
+# then 15 hospitalized as critical
+```
+
+# Overwrite 2 transitions with models that have reduced covariates:
+
+```{r}
+
+# fit entire multistate model with reduced covariates: 
+. = construct_msm_dataset_from_hospitalized_onward_df(hosp_df, use_reduced_covariates = TRUE)
+reduced_dataset = .$dataset
+reduced_covariate_names = .$covariate_names
+
+# no 
+# 1. was_critical
+# 2. age:was_critical 
+# 3. critical,severe state at hospitalization replaced with merged 
+# 4. critical,severe state at hospitalization interaction with age replaced with merged 
+length(dataset[[1]]$covariates) - length(reduced_dataset[[1]]$covariates)
+```
+
+
+
+```{r}
+update_REDUCED_covariates_function = function(sample_covariates, origin_state, target_state, time_at_origin_state, absolute_time_of_entry_to_target_state=NULL) {
+    return(
+      construct_hospitalized_patient_REDUCED_covariates(
+        age = sample_covariates[REDUCED_AGE_COVARIATE_IDX],
+        is_male = sample_covariates[REDUCED_IS_MALE_COVARIATE_IDX],
+        state_at_hospitalization = get_REDUCED_state_at_hospitalization(sample_covariates),
+        
+        # in case prediction starts from t > 0. The cumulative time can be 0, as it was in entry to state.  
+        # But the cumulative time in the next state needs to include both the time spent in the state thus far, and the remaining time
+        cumulative_time_since_hospitalization = max(sample_covariates[REDUCED_CUMULATIVE_TIME_COVARIATE_IDX] + time_at_origin_state, 
+                                                    absolute_time_of_entry_to_target_state), 
+        
+        was_severe = sample_covariates[REDUCED_WAS_SEVERE_COVARIATE_IDX] | (origin_state == SEVERE)
+      )
+    )    
+  }
+```
+
+
+```{r}
+reduced_model = Wave2MultiStateModel()
+reduced_model$fit(reduced_dataset,
+                  terminal_states = TERMINAL_STATES,
+                  update_REDUCED_covariates_function,
+                  covariate_names=reduced_covariate_names)
+```
+
+
+```{r}
+
+stretch = function(reduced_coefs) {
+  
+    new_coefs = c(
+    # 1.age                                  
+    # 2.sexmale                              
+    # 3.state_at_hospitalizationmild         
+    # 4.state_at_hospitalizationmoderate    
+    reduced_coefs[c(REDUCED_AGE_COVARIATE_IDX,
+                    REDUCED_IS_MALE_COVARIATE_IDX,
+                    REDUCED_MILD_COVARIATE_IDX,
+                    REDUCED_MODERATE_COVARIATE_IDX)],
+    
+    # 5.state_at_hospitalizationsevere
+    c(0),
+   
+    # 6.cumulative_time                      
+    # 7.was_severe                           
+    reduced_coefs[c(REDUCED_CUMULATIVE_TIME_COVARIATE_IDX,
+                    REDUCED_WAS_SEVERE_COVARIATE_IDX)],
+    
+    # 8.was_critical                        
+    c(0),
+    
+    # 9.age:sexmale  
+    # 10.age:state_at_hospitalizationmild     
+    # 11.age:state_at_hospitalizationmoderate 
+    reduced_coefs[c(REDUCED_AGE_IS_MALE_INTERACTION_IDX,
+                    REDUCED_AGE_MILD_INTERACTION_IDX,
+                    REDUCED_AGE_MODERATE_INTERACTION_IDX)],
+
+    # 12.age:state_at_hospitalizationsevere  
+    c(0),
+    
+    # 13.age:cumulative_time                  
+    # 14.age:was_severe                       
+    reduced_coefs[c(REDUCED_AGE_CUMULATIVE_TIME_INTERACTION_IDX,
+                    REDUCED_AGE_WAS_SEVERE_INTERACTION_IDX)],
+    
+    # 15.age:was_critical                    
+    c(0)
+    )
+}
+
+# MnM -> Deceased
+reduced_MnM_to_Deceased = reduced_model$state_specific_models[[MILD_OR_MODERATE]]$event_specific_models[[DECEASED]]
+reduced_MnM_to_Deceased$coefficients = stretch(reduced_MnM_to_Deceased$coefficients)
+
+model$state_specific_models[[MILD_OR_MODERATE]]$event_specific_models[[DECEASED]] = reduced_MnM_to_Deceased
+
+# Discharged -> Deceased
+reduced_Discharged_to_Deceased = reduced_model$state_specific_models[[DISCHARGED]]$event_specific_models[[DECEASED]]
+reduced_Discharged_to_Deceased$coefficients = stretch(reduced_Discharged_to_Deceased$coefficients)
+
+model$state_specific_models[[DISCHARGED]]$event_specific_models[[DECEASED]] = reduced_Discharged_to_Deceased
+
+if (USE_15_9_REDUCED_MODEL) {
+  # Discharged -> Severe
+  reduced_Discharged_to_Severe = reduced_model$state_specific_models[[DISCHARGED]]$event_specific_models[[SEVERE]]
+  reduced_Discharged_to_Severe$coefficients = stretch(reduced_Discharged_to_Severe$coefficients)
+
+  model$state_specific_models[[DISCHARGED]]$event_specific_models[[SEVERE]] = reduced_Discharged_to_Severe
+
+  ## Severe -> Deceased
+  # reduced_Severe_to_Deceased = reduced_model$state_specific_models[[SEVERE]]$event_specific_models[[DECEASED]]
+  # reduced_Severe_to_Deceased$coefficients = stretch(reduced_Severe_to_Deceased$coefficients)
+
+  # model$state_specific_models[[SEVERE]]$event_specific_models[[DECEASED]] = reduced_Severe_to_Deceased
+}
+
+```
+
+
+
+```{r}
+#formattable(coefficients_table(model$state_specific_models[[MILD_OR_MODERATE]], covariate_names))
+#formattable(coefficients_table(model$state_specific_models[[DISCHARGED]], covariate_names))
+#formattable(coefficients_table(model$state_specific_models[[SEVERE]], covariate_names))
+```
+
+## Further reduction for 5 -> 7 / Critical -> Discharged Transition
+
+```{r}
+# fit entire multistate model with FURTHER reduced covariates:
+. = construct_msm_dataset_from_hospitalized_onward_df(hosp_df, use_reduced_covariates = TRUE, critical_state_at_hospitalization_only = TRUE)
+further_reduced_dataset = .$dataset
+further_reduced_covariate_names = .$covariate_names
+# no
+# 1. was_critical (-1)
+# 2. age:was_critical (-1)
+# 3. mild, moderate, severe state at hospitalization replaced with merged "not_critical" (-2)
+# 4. mild, moderate, severe state at hospitalization interaction with age replaced with merged (-2)
+# total: -6
+length(dataset[[1]]$covariates) - length(further_reduced_dataset[[1]]$covariates)
+```
+
+```{r}
+update_FURTHER_REDUCED_covariates_function = function(sample_covariates, origin_state, target_state, time_at_origin_state, absolute_time_of_entry_to_target_state=NULL) {
+    return(
+      construct_hospitalized_patient_FURTHER_REDUCED_covariates(
+        age = sample_covariates[FURTHER_REDUCED_AGE_COVARIATE_IDX],
+        is_male = sample_covariates[FURTHER_REDUCED_IS_MALE_COVARIATE_IDX],
+        not_hospitalized_critical = sample_covariates[[FURTHER_REDUCED_NOT_HOSPITALIZED_CRITICAL_COVARIATE_IDX]],
+
+        # in case prediction starts from t > 0. The cumulative time can be 0, as it was in entry to state.
+        # But the cumulative time in the next state needs to include both the time spent in the state thus far, and the remaining time
+        cumulative_time_since_hospitalization = max(sample_covariates[FURTHER_REDUCED_CUMULATIVE_TIME_COVARIATE_IDX] + time_at_origin_state,
+                                                    absolute_time_of_entry_to_target_state),
+
+        was_severe = sample_covariates[FURTHER_REDUCED_WAS_SEVERE_COVARIATE_IDX] | (origin_state == SEVERE)
+      )
+    )
+  }
+```
+
+```{r}
+# further_reduced_model = Wave2MultiStateModel()
+# further_reduced_model$fit(further_reduced_dataset,
+#                          terminal_states = TERMINAL_STATES,
+#                          update_FURTHER_REDUCED_covariates_function,
+#                          covariate_names=further_reduced_covariate_names)
+```
+
+
+```{r}
+# reduced_coefs here are "further_reduced" coefficients
+further_stretch = function(reduced_coefs) {
+
+    new_coefs = c(
+    # 1.age
+    # 2.sexmale
+    # 3.state_at_hospitalizationmild
+    # 4.state_at_hospitalizationmoderate
+    # 5.state_at_hospitalizationsevere
+    reduced_coefs[c(FURTHER_REDUCED_AGE_COVARIATE_IDX,
+                    FURTHER_REDUCED_IS_MALE_COVARIATE_IDX,
+                    FURTHER_REDUCED_NOT_HOSPITALIZED_CRITICAL_COVARIATE_IDX,
+                    FURTHER_REDUCED_NOT_HOSPITALIZED_CRITICAL_COVARIATE_IDX,
+                    FURTHER_REDUCED_NOT_HOSPITALIZED_CRITICAL_COVARIATE_IDX)],
+
+    # 6.cumulative_time
+    # 7.was_severe
+    reduced_coefs[c(FURTHER_REDUCED_CUMULATIVE_TIME_COVARIATE_IDX,
+                    FURTHER_REDUCED_WAS_SEVERE_COVARIATE_IDX)],
+
+    # 8.was_critical
+    c(0),
+
+    # 9.age:sexmale
+    # 10.age:state_at_hospitalizationmild
+    # 11.age:state_at_hospitalizationmoderate
+    # 12.age:state_at_hospitalizationsevere
+    reduced_coefs[c(FURTHER_REDUCED_AGE_IS_MALE_INTERACTION_IDX,
+                    FURTHER_REDUCED_AGE_NOT_HOSPITALIZED_CRITICAL_INTERACTION_IDX,
+                    FURTHER_REDUCED_AGE_NOT_HOSPITALIZED_CRITICAL_INTERACTION_IDX,
+                    FURTHER_REDUCED_AGE_NOT_HOSPITALIZED_CRITICAL_INTERACTION_IDX)],
+
+    # 13.age:cumulative_time
+    # 14.age:was_severe
+    reduced_coefs[c(FURTHER_REDUCED_AGE_CUMULATIVE_TIME_INTERACTION_IDX,
+                    FURTHER_REDUCED_AGE_WAS_SEVERE_INTERACTION_IDX)],
+
+    # 15.age:was_critical
+    c(0)
+    )
+}
+# if (USE_15_9_REDUCED_MODEL) {
+#  # Critical -> Discharged
+#  further_reduced_Critical_to_Discharged = further_reduced_model$state_specific_models[[CRITICAL]]$event_specific_models[[DISCHARGED]]
+#  further_reduced_Critical_to_Discharged$coefficients = further_stretch(further_reduced_Critical_to_Discharged$coefficients)
+
+#  model$state_specific_models[[CRITICAL]]$event_specific_models[[DISCHARGED]] = further_reduced_Critical_to_Discharged
+# }
+```
+
+```{r}
+#formattable(coefficients_table(model$state_specific_models[[CRITICAL]], covariate_names))
+```
+
+
+## 3. Add the `pos-> hosp/home` model to the multi-state model.
+
+```{r}
+model$state_specific_models[[POSITIVE]] = pos_to_hosp_model
+```
+
+
+## 3. Cache Final Model:
+
+
+```{r}
+# cache_file_name = paste("./cache/wave2_fitted_model_TIME=", as.character(Sys.time()), ".Rds", sep="")
+saveRDS(model, MODEL_CACHE_FILE)
+
+rm(list = rm(list=setdiff(ls(), "MODEL_CACHE_FILE")))
+
+m = readRDS(MODEL_CACHE_FILE)
+m$state_specific_models[[1]]$event_specific_models[[2]]$coefficient
+```
+
+
+
+
+
+
+
+
