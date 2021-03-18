@@ -2,7 +2,7 @@
 
 Based on the model developed and described in:  
 [Development and validation of a machine learning model for predicting illness trajectory and hospital resource utilization of COVID-19 hospitalized patients - a nationwide study](https://academic.oup.com/jamia/advance-article/doi/10.1093/jamia/ocab005/6105188?searchresult=1)  
-Original model code [here](https://github.com/JonathanSomer/covid-19-multi-state-model-wave2)
+Original model code [here](https://github.com/JonathanSomer/covid-19-multi-state-model)
 
 Updated to include new patient states (including PCR positive to hospitalization transitions) and based on Israel data from July-December
 
