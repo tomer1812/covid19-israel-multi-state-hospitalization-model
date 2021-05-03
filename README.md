@@ -1,5 +1,7 @@
 # COVID-19 individual illness trajectory model  
 
+Model code for [Hospital load and increased COVID-19 related mortality in Israel](https://www.nature.com/articles/s41467-021-22214-z) (Nature communications 2021)
+
 Based on the model developed and described in:  
 [Development and validation of a machine learning model for predicting illness trajectory and hospital resource utilization of COVID-19 hospitalized patients - a nationwide study](https://academic.oup.com/jamia/advance-article/doi/10.1093/jamia/ocab005/6105188?searchresult=1)  
 Original model code [here](https://github.com/JonathanSomer/covid-19-multi-state-model)
